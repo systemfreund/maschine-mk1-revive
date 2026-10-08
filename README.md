@@ -91,6 +91,13 @@ Run directly for development:
 ./build/Debug/mk1-bridge [--display_tick_ms=16] [--no-partial-display] [--help]
 ```
 
+## Linux (prototype)
+
+`mk1-linux/` contains a separate Linux driver that exposes the MK1 as a MIDI
+controller for DAWs (pads, buttons, encoders, LED feedback and both displays)
+via libusb and the ALSA sequencer. It does not involve the Maschine software.
+See [mk1-linux/README.md](mk1-linux/README.md).
+
 ## How it works
 
 The MK1 originally required `NIUSBMaschineController.kext` — a kernel extension that never received an ARM64 build. This project replaces it entirely in userspace.

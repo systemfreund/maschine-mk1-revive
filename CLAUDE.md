@@ -10,6 +10,7 @@ without the original kext. All RE work is on a legitimately-owned device for int
 | `mk1-usb/` | Core USB layer (IOKit bulk transfers, caiaq init, display, LEDs) |
 | `mk1-ipc/` | CFMessagePort IPC layer (mimics NIHardwareAgent ↔ Maschine app) |
 | `mk1-bridge/` | Bridge daemon: registers NIHWMainHandler, owns IPC + USB |
+| `mk1-linux/` | Linux userspace driver: libusb + ALSA sequencer, MK1 as a MIDI controller for DAWs (no Maschine software) |
 | `mk1-shim/` | DYLIB shim — reference only; has working LED selector dispatch |
 | `mk1-ipc-test/` | Standalone IPC handshake smoke-test |
 | `mk1-ipc-sniffer/` | Passive sniffer for CFMessagePort traffic |

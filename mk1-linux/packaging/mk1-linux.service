@@ -1,0 +1,11 @@
+[Unit]
+Description=Maschine MK1 MIDI driver (mk1-linux)
+Documentation=https://github.com/systemfreund/maschine-mk1-revive
+
+[Service]
+ExecStart=/usr/local/bin/mk1-linux
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
