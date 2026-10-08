@@ -8,14 +8,16 @@
 struct mk1_midi {
     snd_seq_t        *seq;
     int               port[MK1_PORT_COUNT];
-    snd_midi_event_t *din_parser;    // raw bytes -> events (DIN in)
-    snd_midi_event_t *din_encoder;   // events -> raw bytes (DIN out)
+    snd_midi_event_t *parser[MK1_PORT_COUNT];    // raw bytes -> events
+    snd_midi_event_t *decoder[MK1_PORT_COUNT];   // events -> raw bytes
     pthread_mutex_t   out_lock;
+    pthread_mutex_t   raw_lock;                  // guards the parsers
 };
 
 static const char *const k_port_names[MK1_PORT_COUNT] = {
     [MK1_PORT_CONTROLLER] = "MK1 Controller",
     [MK1_PORT_DIN]        = "MK1 DIN",
+    [MK1_PORT_MACKIE]     = "MK1 Mackie",
 };
 
 mk1_midi_t *mk1_midi_open(const char *client_name)
@@ -24,10 +26,12 @@ mk1_midi_t *mk1_midi_open(const char *client_name)
     int rc;
 
     if (!midi) return NULL;
+    pthread_mutex_init(&midi->out_lock, NULL);
+    pthread_mutex_init(&midi->raw_lock, NULL);
     rc = snd_seq_open(&midi->seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK);
     if (rc < 0) {
         MK1_LOG("cannot open ALSA sequencer: %s", snd_strerror(rc));
-        free(midi);
+        mk1_midi_close(midi);
         return NULL;
     }
     snd_seq_set_client_name(midi->seq, client_name);
@@ -46,23 +50,27 @@ mk1_midi_t *mk1_midi_open(const char *client_name)
         }
     }
 
-    if (snd_midi_event_new(256, &midi->din_parser) < 0 ||
-        snd_midi_event_new(256, &midi->din_encoder) < 0) {
-        mk1_midi_close(midi);
-        return NULL;
+    for (int p = 0; p < MK1_PORT_COUNT; p++) {
+        if (snd_midi_event_new(512, &midi->parser[p]) < 0 ||
+            snd_midi_event_new(512, &midi->decoder[p]) < 0) {
+            mk1_midi_close(midi);
+            return NULL;
+        }
+        snd_midi_event_no_status(midi->decoder[p], 1);   // no running status on the wire
     }
-    snd_midi_event_no_status(midi->din_encoder, 1);   // no running status on the wire
-    pthread_mutex_init(&midi->out_lock, NULL);
     return midi;
 }
 
 void mk1_midi_close(mk1_midi_t *midi)
 {
     if (!midi) return;
-    if (midi->din_parser) snd_midi_event_free(midi->din_parser);
-    if (midi->din_encoder) snd_midi_event_free(midi->din_encoder);
+    for (int p = 0; p < MK1_PORT_COUNT; p++) {
+        if (midi->parser[p]) snd_midi_event_free(midi->parser[p]);
+        if (midi->decoder[p]) snd_midi_event_free(midi->decoder[p]);
+    }
     if (midi->seq) snd_seq_close(midi->seq);
     pthread_mutex_destroy(&midi->out_lock);
+    pthread_mutex_destroy(&midi->raw_lock);
     free(midi);
 }
 
@@ -141,16 +149,19 @@ void mk1_midi_cc(mk1_midi_t *midi, mk1_midi_port_t port, int channel, int cc, in
 
 void mk1_midi_raw(mk1_midi_t *midi, mk1_midi_port_t port, const uint8_t *data, size_t len)
 {
+    pthread_mutex_lock(&midi->raw_lock);
     for (size_t i = 0; i < len; i++) {
         snd_seq_event_t ev;
         snd_seq_ev_clear(&ev);
-        if (snd_midi_event_encode_byte(midi->din_parser, data[i], &ev) == 1) {
+        if (snd_midi_event_encode_byte(midi->parser[port], data[i], &ev) == 1) {
             send_event(midi, port, &ev);
         }
     }
+    pthread_mutex_unlock(&midi->raw_lock);
 }
 
-long mk1_midi_event_to_bytes(mk1_midi_t *midi, const snd_seq_event_t *ev, uint8_t *buf, size_t len)
+long mk1_midi_event_to_bytes(mk1_midi_t *midi, mk1_midi_port_t port, const snd_seq_event_t *ev,
+                             uint8_t *buf, size_t len)
 {
-    return snd_midi_event_decode(midi->din_encoder, buf, (long)len, ev);
+    return snd_midi_event_decode(midi->decoder[port], buf, (long)len, ev);
 }

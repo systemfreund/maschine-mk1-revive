@@ -13,7 +13,7 @@ PKG_LIBS   := $(shell pkg-config --libs $(PKGS))
 PREFIX  ?= /usr/local
 DESTDIR ?=
 
-CORE_SRC = src/mk1_input.c src/mk1_leds.c src/mk1_display.c
+CORE_SRC = src/mk1_input.c src/mk1_leds.c src/mk1_display.c src/mk1_mackie.c
 APP_SRC  = src/main.c src/mk1_usb.c src/mk1_midi.c $(CORE_SRC)
 HEADERS  = $(wildcard src/*.h)
 

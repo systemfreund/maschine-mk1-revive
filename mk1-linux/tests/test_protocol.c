@@ -6,6 +6,7 @@
 #include "mk1_display.h"
 #include "mk1_input.h"
 #include "mk1_leds.h"
+#include "mk1_mackie.h"
 
 static int g_failures;
 
@@ -385,6 +386,167 @@ static void test_display(void)
     CHECK(mk1_display_init_cmds[mk1_display_init_cmd_count - 1].bytes[0] == 0xaf);
 }
 
+// ---------------------------------------------------------------------------
+// Mackie Control
+// ---------------------------------------------------------------------------
+
+typedef struct { uint8_t bytes[64][24]; size_t len[64]; int n; } mcu_out_t;
+
+static void mcu_capture(void *ctx, const uint8_t *bytes, size_t len)
+{
+    mcu_out_t *o = ctx;
+    if (o->n < 64 && len <= 24) {
+        memcpy(o->bytes[o->n], bytes, len);
+        o->len[o->n++] = len;
+    }
+}
+
+static bool sent(const mcu_out_t *o, int i, uint8_t a, uint8_t b, uint8_t c)
+{
+    return i < o->n && o->len[i] == 3 && o->bytes[i][0] == a && o->bytes[i][1] == b && o->bytes[i][2] == c;
+}
+
+static void host(mk1_mcu_t *m, uint8_t a, uint8_t b, uint8_t c)
+{
+    const uint8_t msg[3] = { a, b, c };
+    mk1_mcu_host_message(m, msg, 3);
+}
+
+static void test_mcu_buttons(void)
+{
+    static mk1_mcu_t m;
+    static mcu_out_t o;
+    memset(&o, 0, sizeof(o));
+    mk1_mcu_init(&m, mcu_capture, &o);
+
+    // Screen 3 = select strip 3
+    CHECK(mk1_mcu_button(&m, MK1_BTN_SCREEN3, true));
+    CHECK(mk1_mcu_button(&m, MK1_BTN_SCREEN3, false));
+    CHECK(o.n == 2 && sent(&o, 0, 0x90, 0x1a, 0x7f) && sent(&o, 1, 0x90, 0x1a, 0x00));
+
+    // Mute + Screen 1 = mute strip 1; the release matches the press even if
+    // Mute is let go first.
+    o.n = 0;
+    mk1_mcu_button(&m, MK1_BTN_MUTE, true);
+    mk1_mcu_button(&m, MK1_BTN_SCREEN1, true);
+    mk1_mcu_button(&m, MK1_BTN_MUTE, false);
+    mk1_mcu_button(&m, MK1_BTN_SCREEN1, false);
+    CHECK(o.n == 2 && sent(&o, 0, 0x90, 0x10, 0x7f) && sent(&o, 1, 0x90, 0x10, 0x00));
+
+    // Rec on its own = transport record (sent on release)
+    o.n = 0;
+    mk1_mcu_button(&m, MK1_BTN_REC, true);
+    CHECK(o.n == 0);
+    mk1_mcu_button(&m, MK1_BTN_REC, false);
+    CHECK(o.n == 2 && sent(&o, 0, 0x90, 0x5f, 0x7f) && sent(&o, 1, 0x90, 0x5f, 0x00));
+
+    // Rec + Screen 2 = arm strip 2, no transport record
+    o.n = 0;
+    mk1_mcu_button(&m, MK1_BTN_REC, true);
+    mk1_mcu_button(&m, MK1_BTN_SCREEN2, true);
+    mk1_mcu_button(&m, MK1_BTN_SCREEN2, false);
+    mk1_mcu_button(&m, MK1_BTN_REC, false);
+    CHECK(o.n == 2 && sent(&o, 0, 0x90, 0x01, 0x7f));
+
+    // Shift + Group A = F1, plain Group A = Track assign
+    o.n = 0;
+    mk1_mcu_button(&m, MK1_BTN_SHIFT, true);
+    mk1_mcu_button(&m, MK1_BTN_GROUP_A, true);
+    mk1_mcu_button(&m, MK1_BTN_SHIFT, false);
+    mk1_mcu_button(&m, MK1_BTN_GROUP_A, false);
+    mk1_mcu_button(&m, MK1_BTN_GROUP_A, true);
+    CHECK(o.n == 3 && sent(&o, 0, 0x90, 0x36, 0x7f) && sent(&o, 1, 0x90, 0x36, 0x00) &&
+          sent(&o, 2, 0x90, 0x28, 0x7f));
+
+    // Buttons without an MCU function fall through to the CC layer.
+    o.n = 0;
+    CHECK(!mk1_mcu_button(&m, MK1_BTN_PATTERN, true));
+    CHECK(!mk1_mcu_button(&m, MK1_BTN_PATTERN, false));
+    CHECK(o.n == 0);
+}
+
+static void test_mcu_encoders(void)
+{
+    static mk1_mcu_t m;
+    static mcu_out_t o;
+    uint64_t t = 1000000000ULL;
+    memset(&o, 0, sizeof(o));
+    mk1_mcu_init(&m, mcu_capture, &o);
+
+    mk1_mcu_encoder(&m, MK1_ENC_SCREEN1, 3, t);
+    mk1_mcu_encoder(&m, MK1_ENC_SCREEN8, -2, t);
+    mk1_mcu_encoder(&m, MK1_ENC_TEMPO, 1, t);
+    CHECK(sent(&o, 0, 0xb0, 0x10, 0x03) && sent(&o, 1, 0xb0, 0x17, 0x42) && sent(&o, 2, 0xb0, 0x3c, 0x01));
+
+    // Volume = master fader: touch, then pitch bend on channel 9; touch
+    // released after the knob stops.
+    o.n = 0;
+    mk1_mcu_encoder(&m, MK1_ENC_VOLUME, 4, t);
+    CHECK(o.n == 2 && sent(&o, 0, 0x90, 0x70, 0x7f) && sent(&o, 1, 0xe8, 0x00, 0x04));
+    mk1_mcu_tick(&m, t + 100000000ULL);
+    CHECK(o.n == 2);
+    mk1_mcu_tick(&m, t + 500000000ULL);
+    CHECK(o.n == 3 && sent(&o, 2, 0x90, 0x70, 0x00));
+
+    // Swing = fader of the strip the DAW reports as selected.
+    o.n = 0;
+    host(&m, 0x90, 0x1a, 0x7f);   // strip 3 selected
+    mk1_mcu_encoder(&m, MK1_ENC_SWING, -1, t);
+    CHECK(o.n == 2 && sent(&o, 0, 0x90, 0x6a, 0x7f) && o.bytes[1][0] == 0xe2);
+}
+
+static void test_mcu_host(void)
+{
+    static mk1_mcu_t m;
+    static mcu_out_t o;
+    static mk1_canvas_t c;
+    memset(&o, 0, sizeof(o));
+    mk1_mcu_init(&m, mcu_capture, &o);
+
+    // Handshake
+    const uint8_t query[] = { 0xf0, 0x00, 0x00, 0x66, 0x14, 0x00, 0xf7 };
+    mk1_mcu_host_message(&m, query, sizeof(query));
+    CHECK(o.n == 1 && o.len[0] == 18 && o.bytes[0][5] == 0x01 && o.bytes[0][17] == 0xf7);
+
+    // LCD text at offset 7 (strip 2, upper row) and 56 (strip 1, lower row)
+    const uint8_t lcd1[] = { 0xf0, 0x00, 0x00, 0x66, 0x14, 0x12, 7, 'B', 'a', 's', 's', 0xf7 };
+    const uint8_t lcd2[] = { 0xf0, 0x00, 0x00, 0x66, 0x14, 0x12, 56, '-', '6', 'd', 'B', 0xf7 };
+    CHECK(mk1_mcu_host_message(&m, lcd1, sizeof(lcd1)) & MK1_MCU_CHANGED_DISPLAY);
+    mk1_mcu_host_message(&m, lcd2, sizeof(lcd2));
+    CHECK(memcmp(&m.lcd[0][7], "Bass", 4) == 0 && memcmp(&m.lcd[1][0], "-6dB", 4) == 0);
+
+    // LEDs
+    host(&m, 0x90, 0x5e, 0x7f);   // Play
+    host(&m, 0x90, 0x12, 0x7f);   // mute strip 3
+    host(&m, 0x90, 0x5f, 0x01);   // record blinking
+    CHECK(mk1_mcu_button_led(&m, MK1_BTN_PLAY) == 127);
+    CHECK(mk1_mcu_button_led(&m, MK1_BTN_REC) == 64);
+    CHECK(mk1_mcu_button_led(&m, MK1_BTN_SCREEN3) == 0);   // shows select
+    mk1_mcu_button(&m, MK1_BTN_MUTE, true);
+    CHECK(mk1_mcu_button_led(&m, MK1_BTN_SCREEN3) == 127); // shows mute while held
+    mk1_mcu_button(&m, MK1_BTN_MUTE, false);
+    CHECK(mk1_mcu_button_led(&m, MK1_BTN_PATTERN) == -1);
+
+    // V-Pot ring, fader, meter + decay
+    host(&m, 0xb0, 0x31, 0x16);
+    host(&m, 0xe1, 0x7f, 0x7f);
+    host(&m, 0xd0, 0x25, 0x00);
+    CHECK(m.vpot_ring[1] == 0x16 && m.fader[1] == 16383 && m.meter[2] == 5);
+    mk1_mcu_tick(&m, 2000000000ULL);
+    CHECK(m.meter[2] == 4);
+
+    // Rendering: selected strip 2 gets an inverted name bar.
+    host(&m, 0x90, 0x19, 0x7f);
+    mk1_mcu_render(&m, 0, &c);
+    CHECK(c.px[0][64 + 2] == MK1_DISPLAY_MAX_GRAY && c.px[0][2] == 0);
+    mk1_mcu_render(&m, 1, &c);
+
+    // Reset
+    const uint8_t reset[] = { 0xf0, 0x00, 0x00, 0x66, 0x14, 0x63, 0xf7 };
+    mk1_mcu_host_message(&m, reset, sizeof(reset));
+    CHECK(m.note[0x5e] == 0 && m.lcd[0][7] == ' ');
+}
+
 int main(void)
 {
     test_pad_hit_and_release();
@@ -397,6 +559,9 @@ int main(void)
     test_len33_buttons();
     test_leds();
     test_display();
+    test_mcu_buttons();
+    test_mcu_encoders();
+    test_mcu_host();
 
     if (g_failures) {
         fprintf(stderr, "%d check(s) failed\n", g_failures);

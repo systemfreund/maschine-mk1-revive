@@ -25,6 +25,7 @@
 #include "mk1_input.h"
 #include "mk1_leds.h"
 #include "mk1_log.h"
+#include "mk1_mackie.h"
 #include "mk1_midi.h"
 #include "mk1_proto.h"
 #include "mk1_usb.h"
@@ -94,6 +95,8 @@ typedef struct {
     int    encoder_divisor;
     bool   local_leds;
     int    backlight;
+    bool   mackie;             // buttons/knobs drive the MK1 Mackie port
+    int    display_fps;
     mk1_input_config_t input;
 } config_t;
 
@@ -126,6 +129,7 @@ static double env_double(const char *name, double fallback, double lo, double hi
 static void load_config(config_t *cfg)
 {
     const char *mode = getenv("MK1_ENCODER_MODE");
+    const char *layer = getenv("MK1_MODE");
 
     cfg->channel         = env_int("MK1_MIDI_CHANNEL", 1, 1, 16) - 1;
     cfg->pad_base_note   = env_int("MK1_PAD_BASE_NOTE", 36, 0, 127 - 15);
@@ -137,6 +141,11 @@ static void load_config(config_t *cfg)
     cfg->encoder_divisor = env_int("MK1_ENCODER_DIVISOR", 2, 1, 64);
     cfg->local_leds      = env_int("MK1_LOCAL_LEDS", 1, 0, 1) != 0;
     cfg->backlight       = env_int("MK1_BACKLIGHT", MK1_LED_BACKLIGHT_ON, 0, 127);
+    cfg->mackie          = layer && strcasecmp(layer, "mackie") == 0;
+    cfg->display_fps     = env_int("MK1_DISPLAY_FPS", 20, 1, 60);
+    if (layer && !cfg->mackie && strcasecmp(layer, "midi") != 0) {
+        MK1_LOG("ignoring MK1_MODE=%s (expected midi or mackie)", layer);
+    }
 
     mk1_input_default_config(&cfg->input);
     cfg->input.pad_hit_on        = env_int("MK1_PAD_HIT_ON", cfg->input.pad_hit_on, 1, MK1_PAD_MAX);
@@ -166,6 +175,7 @@ typedef struct {
     mk1_input_t      input;
 
     pthread_mutex_t  lock;          // guards everything below
+    mk1_mcu_t        mcu;
     uint8_t          led_host[MK1_LED_COUNT];    // set by MIDI feedback
     uint8_t          led_local[MK1_LED_COUNT];   // pressed buttons / pads
     bool             leds_dirty;
@@ -263,9 +273,31 @@ static void cb_pad_release(void *ctx, unsigned pad)
     pthread_mutex_unlock(&app->lock);
 }
 
+static void mcu_send(void *ctx, const uint8_t *bytes, size_t len)
+{
+    app_t *app = ctx;
+    mk1_midi_raw(app->midi, MK1_PORT_MACKIE, bytes, len);
+}
+
 static void cb_button(void *ctx, mk1_button_t button, bool pressed)
 {
     app_t *app = ctx;
+
+    if (app->cfg.mackie) {
+        pthread_mutex_lock(&app->lock);
+        bool handled = mk1_mcu_button(&app->mcu, button, pressed);
+        if (handled) {
+            set_local_led(app, mk1_button_led_slot(button), pressed ? MK1_LED_BRIGHT : 0);
+            app->leds_dirty = true;   // screen LEDs follow the held modifier
+            app->display_dirty[0] = app->display_dirty[1] = true;
+            if (pressed) set_status(app, "%s (Mackie)", mk1_button_name(button));
+        }
+        pthread_mutex_unlock(&app->lock);
+        MK1_DEBUG("button %s %s -> %s", mk1_button_name(button), pressed ? "down" : "up",
+                  handled ? "Mackie" : "CC");
+        if (handled) return;
+    }
+
     mk1_midi_cc(app->midi, MK1_PORT_CONTROLLER, app->cfg.channel, k_button_cc[button], pressed ? 127 : 0);
     MK1_DEBUG("button %s %s -> CC %d", mk1_button_name(button), pressed ? "down" : "up", k_button_cc[button]);
 
@@ -285,6 +317,14 @@ static void cb_encoder(void *ctx, mk1_encoder_t enc, int delta)
     steps = app->enc_accum[enc] / app->cfg.encoder_divisor;
     app->enc_accum[enc] -= steps * app->cfg.encoder_divisor;
     if (steps == 0) {
+        pthread_mutex_unlock(&app->lock);
+        return;
+    }
+    if (app->cfg.mackie) {
+        unsigned changed = mk1_mcu_encoder(&app->mcu, enc, steps, now_ns());
+        if (changed & MK1_MCU_CHANGED_DISPLAY) {
+            app->display_dirty[0] = app->display_dirty[1] = true;
+        }
         pthread_mutex_unlock(&app->lock);
         return;
     }
@@ -412,7 +452,7 @@ static void handle_controller_event(app_t *app, const snd_seq_event_t *ev)
 static void handle_din_event(app_t *app, const snd_seq_event_t *ev)
 {
     uint8_t bytes[256];
-    long n = mk1_midi_event_to_bytes(app->midi, ev, bytes, sizeof(bytes));
+    long n = mk1_midi_event_to_bytes(app->midi, MK1_PORT_DIN, ev, bytes, sizeof(bytes));
 
     if (n <= 0 || !app->usb) return;
     // [0x07, port, len, bytes...]; EP1 packets are limited to 64 bytes.
@@ -427,11 +467,34 @@ static void handle_din_event(app_t *app, const snd_seq_event_t *ev)
     }
 }
 
+static void apply_mcu_changes(app_t *app, unsigned changed)
+{
+    if (changed & MK1_MCU_CHANGED_LEDS) app->leds_dirty = true;
+    if (changed & MK1_MCU_CHANGED_DISPLAY) {
+        app->display_dirty[0] = app->display_dirty[1] = true;
+    }
+}
+
+static void handle_mackie_event(app_t *app, const snd_seq_event_t *ev)
+{
+    uint8_t bytes[512];
+    long n = mk1_midi_event_to_bytes(app->midi, MK1_PORT_MACKIE, ev, bytes, sizeof(bytes));
+    if (n <= 0) return;
+
+    pthread_mutex_lock(&app->lock);
+    apply_mcu_changes(app, mk1_mcu_host_message(&app->mcu, bytes, (size_t)n));
+    pthread_mutex_unlock(&app->lock);
+}
+
 static void on_midi_event(void *ctx, mk1_midi_port_t port, const snd_seq_event_t *ev)
 {
     app_t *app = ctx;
     if (port == MK1_PORT_DIN) {
         handle_din_event(app, ev);
+        return;
+    }
+    if (port == MK1_PORT_MACKIE) {
+        if (app->cfg.mackie) handle_mackie_event(app, ev);
         return;
     }
     pthread_mutex_lock(&app->lock);
@@ -455,6 +518,16 @@ static void flush_leds(app_t *app)
     }
     for (int i = 0; i < MK1_LED_COUNT; i++) {
         leds.value[i] = app->led_host[i] > app->led_local[i] ? app->led_host[i] : app->led_local[i];
+    }
+    if (app->cfg.mackie) {
+        // Button LEDs mirror the DAW's Mackie LED state instead of CC feedback.
+        for (int btn = 0; btn < MK1_BTN_COUNT; btn++) {
+            int level = mk1_mcu_button_led(&app->mcu, (mk1_button_t)btn);
+            uint8_t slot = mk1_button_led_slot((mk1_button_t)btn);
+            if (level < 0 || slot >= MK1_LED_COUNT) continue;
+            uint8_t host = mk1_led_level((unsigned)level);
+            leds.value[slot] = host > app->led_local[slot] ? host : app->led_local[slot];
+        }
     }
     leds.value[MK1_LED_BACKLIGHT] = (uint8_t)app->cfg.backlight;
     app->leds_dirty = false;
@@ -528,6 +601,8 @@ static void flush_displays(app_t *app)
         app->display_dirty[d] = false;
         if (app->host_text_active[d]) {
             render_text_page(app, d, &canvas);
+        } else if (app->cfg.mackie) {
+            mk1_mcu_render(&app->mcu, d, &canvas);
         } else {
             render_knob_page(app, d, &canvas);
         }
@@ -628,7 +703,9 @@ int main(int argc, char **argv)
 
     app.midi = mk1_midi_open("Maschine MK1");
     if (!app.midi) return 1;
-    MK1_LOG("ALSA sequencer client %d: ports 'MK1 Controller' and 'MK1 DIN'", mk1_midi_client_id(app.midi));
+    MK1_LOG("ALSA sequencer client %d: ports 'MK1 Controller', 'MK1 DIN', 'MK1 Mackie' (%s mode)",
+            mk1_midi_client_id(app.midi), app.cfg.mackie ? "Mackie" : "MIDI");
+    mk1_mcu_init(&app.mcu, mcu_send, &app);
 
     int rc = libusb_init(&app.usb_ctx);
     if (rc != 0) {
@@ -674,10 +751,16 @@ int main(int argc, char **argv)
             MK1_LOG("poll failed: %s", strerror(errno));
         }
 
+        if (app.cfg.mackie) {
+            pthread_mutex_lock(&app.lock);
+            apply_mcu_changes(&app, mk1_mcu_tick(&app.mcu, now));
+            pthread_mutex_unlock(&app.lock);
+        }
+
         if (app.usb) {
             flush_leds(&app);
-            // A full frame is ~22 EP8 transfers; cap display refresh at ~30 Hz.
-            if (now - last_display_flush > 33000000ULL) {
+            // A full frame is ~22 EP8 transfers per display; cap the refresh rate.
+            if (now - last_display_flush > 1000000000ULL / (uint64_t)app.cfg.display_fps) {
                 last_display_flush = now;
                 flush_displays(&app);
             }
