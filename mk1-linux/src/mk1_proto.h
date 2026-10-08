@@ -123,9 +123,12 @@ typedef enum {
 #define MK1_LED_BRIGHT         0x5c
 
 // Pad rubber LED slot for 0-based pad index (pad 1 = bottom-left = index 0).
+// Slots run from the top-right pad (slot 0) to the bottom-left pad (slot 15),
+// matching CABL's led(index) table (key 0 -> Led::Pad13 = slot 15). Verified
+// on hardware: the row-only mapping lit the vertically mirrored pad.
 static inline uint8_t mk1_pad_led_slot(unsigned pad)
 {
-    return (uint8_t)((pad / 4) * 4 + (3 - (pad % 4)));
+    return (uint8_t)(MK1_PAD_COUNT - 1 - pad);
 }
 
 // ---------------------------------------------------------------------------

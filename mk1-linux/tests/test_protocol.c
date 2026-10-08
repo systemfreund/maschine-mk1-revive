@@ -302,11 +302,12 @@ static void test_leds(void)
     CHECK(a[0] == 0x0c && a[1] == 0x00 && a[2] == 1 && a[32] == 31);
     CHECK(b[0] == 0x0c && b[1] == 0x1e && b[2] == 32 && b[32] == 62);
 
-    // Pad 1 (bottom-left) is slot 3, pad 4 slot 0, pad 13 slot 15, pad 16 slot 12.
-    CHECK(mk1_pad_led_slot(0) == 3);
-    CHECK(mk1_pad_led_slot(3) == 0);
-    CHECK(mk1_pad_led_slot(12) == 15);
-    CHECK(mk1_pad_led_slot(15) == 12);
+    // Pad 1 (bottom-left) is slot 15, pad 4 slot 12, pad 13 slot 3, pad 16 slot 0.
+    CHECK(mk1_pad_led_slot(0) == 15);
+    CHECK(mk1_pad_led_slot(3) == 12);
+    CHECK(mk1_pad_led_slot(4) == 11);
+    CHECK(mk1_pad_led_slot(12) == 3);
+    CHECK(mk1_pad_led_slot(15) == 0);
 
     CHECK(mk1_button_led_slot(MK1_BTN_PLAY) == 29);
     CHECK(mk1_button_led_slot(MK1_BTN_GROUP_A) == 40);
